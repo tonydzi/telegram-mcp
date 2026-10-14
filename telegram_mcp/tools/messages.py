@@ -985,6 +985,83 @@ async def get_message_context(
         )
 
 
+def _fwd_preview(m, width: int = 60) -> str:
+    """One-line 'date · text' view of a message for forward receipts."""
+    if m is None:
+        return "<missing>"
+    action = getattr(m, "action", None)
+    if action is not None:
+        return f"<service {type(action).__name__}>"
+    date = getattr(m, "date", None)
+    day = date.strftime("%Y-%m-%d") if date else "?"
+    text = (getattr(m, "message", None) or "").replace("\n", " ").strip()
+    if not text and getattr(m, "media", None) is not None:
+        text = f"<media {type(m.media).__name__}>"
+    if len(text) > width:
+        text = text[:width] + "…"
+    return f"{day} · {text or '<empty>'}"
+
+
+async def _forward_checked(cl, from_entity, to_entity, ids, expect_texts, label):
+    """Forward `ids` and prove what actually arrived.
+
+    Why (incidents 15.09.2026 and 14.10.2026): the tool used to answer
+    "N messages forwarded" from len(request). Message ids are PER ACCOUNT in
+    basic groups and DMs, so the same numbers read by another account point
+    at foreign messages (14.10: a 2021 message reached a lead), and a service
+    action (pin) silently drops content (15.09). Here we read the source with
+    the SAME client that forwards, refuse missing/service ids and unmatched
+    `expect_texts` before sending, then count and compare what landed.
+    """
+    ids = list(ids)
+    src = await cl.get_messages(from_entity, ids=ids)
+    if not isinstance(src, list):
+        src = [src]
+    problems = []
+    for i, m in zip(ids, src):
+        if m is None:
+            problems.append(f"id {i}: no such message for this account in the source chat")
+        elif getattr(m, "action", None) is not None:
+            problems.append(f"id {i}: service action {type(m.action).__name__}, not content")
+    if expect_texts:
+        hay = [(getattr(m, "message", None) or "") for m in src if m is not None]
+        for t in expect_texts:
+            if not any(t in h for h in hay):
+                problems.append(f"expected text not found in these ids: {t!r}")
+    if problems:
+        lines = [f"Error: forward refused, nothing sent ({label}):"]
+        lines += [f"  - {p}" for p in problems]
+        lines.append("  Source as THIS account sees it:")
+        lines += [f"    {i}: {_fwd_preview(m)}" for i, m in zip(ids, src)]
+        lines.append(
+            "  Ids are per account in basic groups/DMs: take them from "
+            "get_history/search_messages with the same account."
+        )
+        return "\n".join(lines)
+
+    sent = await cl.forward_messages(to_entity, ids, from_entity)
+    if not isinstance(sent, list):
+        sent = [sent]
+    sent = [m for m in sent if m is not None]
+    mismatched = [
+        (s.id, d)
+        for s, d in zip(src, sent)
+        if (getattr(s, "message", None) or "") != (getattr(d, "message", None) or "")
+    ]
+    ok = len(sent) == len(ids) and not mismatched
+    head = (
+        f"{len(sent)} of {len(ids)} messages forwarded ({label}); "
+        f"destination check: {'OK' if ok else 'MISMATCH'}."
+    )
+    lines = [head if ok else "Warning: " + head]
+    for idx, i in enumerate(ids):
+        dst = sent[idx].id if idx < len(sent) else "-"
+        lines.append(f"  src {i} -> dst {dst} · {_fwd_preview(src[idx])}")
+    if mismatched:
+        lines.append(f"  text differs in destination for src ids: {[s for s, _ in mismatched]}")
+    return "\n".join(lines)
+
+
 @mcp.tool(
     annotations=ToolAnnotations(title="Forward Message", openWorldHint=True, destructiveHint=True)
 )
@@ -996,6 +1073,7 @@ async def forward_message(
     to_chat_id: Union[int, str],
     account: str = None,
     expand_album: bool = True,
+    expect_texts: Optional[List[str]] = None,
 ) -> str:
     """
     Forward a message (or several) from a source chat to a destination chat.
@@ -1021,6 +1099,13 @@ async def forward_message(
         account: Optional account label for multi-account mode.
         expand_album: If True (default) and message_id is a single int, the
             server expands albums automatically. No effect on list inputs.
+        expect_texts: Optional snippets that MUST occur in the source
+            messages (as the forwarding account sees them). Any snippet
+            missing -> nothing is forwarded and the source is shown.
+
+    Safety: ids are per account in basic groups and DMs. The tool reads the
+    source with the same account, refuses missing ids and service actions,
+    and the receipt lists src -> dst ids with date and text of what landed.
     """
     try:
         cl = get_client(account)
@@ -1048,16 +1133,11 @@ async def forward_message(
                     ids_to_forward = sibling_ids
                     expanded_from_album = True
 
-        await cl.forward_messages(to_entity, ids_to_forward, from_entity)
-        count = len(ids_to_forward) if isinstance(ids_to_forward, list) else 1
-        if count == 1:
-            return f"Message {message_id} forwarded from {from_chat_id} to {to_chat_id}."
+        ids_list = ids_to_forward if isinstance(ids_to_forward, list) else [ids_to_forward]
+        label = f"from {from_chat_id} to {to_chat_id}, account {account or 'default'}"
         if expanded_from_album:
-            return (
-                f"Album of {count} messages forwarded from {from_chat_id} "
-                f"to {to_chat_id} (auto-expanded from message {message_id})."
-            )
-        return f"{count} messages forwarded from {from_chat_id} to {to_chat_id}."
+            label += f", album auto-expanded from {message_id}"
+        return await _forward_checked(cl, from_entity, to_entity, ids_list, expect_texts, label)
     except Exception as e:
         return log_and_format_error(
             "forward_message",
@@ -1080,6 +1160,7 @@ async def forward_messages(
     message_ids: List[int],
     to_chat_id: Union[int, str],
     account: str = None,
+    expect_texts: Optional[List[str]] = None,
 ) -> str:
     """
     Forward a BATCH of messages from a source chat to a destination chat in
@@ -1101,6 +1182,13 @@ async def forward_messages(
             (e.g. [12345, 12346]). Must contain at least one id.
         to_chat_id: Destination chat (id or @username).
         account: Optional account label for multi-account mode.
+        expect_texts: Optional snippets that MUST occur in the source
+            messages (as the forwarding account sees them). Any snippet
+            missing -> nothing is forwarded and the source is shown.
+
+    Safety: ids are per account in basic groups and DMs. The tool reads the
+    source with the same account, refuses missing ids and service actions,
+    and the receipt lists src -> dst ids with date and text of what landed.
     """
     try:
         if not message_ids:
@@ -1108,8 +1196,10 @@ async def forward_messages(
         cl = get_client(account)
         from_entity = await resolve_entity(from_chat_id, cl)
         to_entity = await resolve_entity(to_chat_id, cl)
-        await cl.forward_messages(to_entity, list(message_ids), from_entity)
-        return f"{len(message_ids)} messages forwarded from " f"{from_chat_id} to {to_chat_id}."
+        label = f"from {from_chat_id} to {to_chat_id}, account {account or 'default'}"
+        return await _forward_checked(
+            cl, from_entity, to_entity, list(message_ids), expect_texts, label
+        )
     except Exception as e:
         return log_and_format_error(
             "forward_messages",
