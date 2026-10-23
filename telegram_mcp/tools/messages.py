@@ -1045,7 +1045,17 @@ async def _forward_checked(cl, from_entity, to_entity, ids, expect_texts, label)
         sent = [sent]
     # Telethon keeps None in request order for messages that did not land;
     # never compact the list, or later destinations shift onto earlier sources.
-    sent = list(sent) + [None] * (len(ids) - len(sent))
+    if len(sent) != len(ids):
+        # A result list of another length carries no positions: any pairing is a guess.
+        landed = sum(1 for d in sent if d is not None)
+        lines = [
+            f"Warning: {landed} of {len(ids)} messages forwarded ({label}); "
+            f"destination check: MISMATCH.",
+            f"  Telegram returned {len(sent)} results for {len(ids)} ids: src -> dst pairing unknown,"
+            " read the destination chat before claiming delivery.",
+        ]
+        lines += [f"  src {i} -> dst ? · {_fwd_preview(s)}" for i, s in zip(ids, src)]
+        return "\n".join(lines)
     landed = sum(1 for d in sent if d is not None)
     body, bad = [], 0
     for i, s, d in zip(ids, src, sent):

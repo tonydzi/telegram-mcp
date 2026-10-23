@@ -162,6 +162,16 @@ async def test_dropped_middle_message_keeps_pairing(accounts):
 
 
 @pytest.mark.asyncio
+async def test_short_result_list_does_not_invent_pairs(accounts):
+    # Retro panel 23.10: a compacted result (no None) must not be paired by position.
+    accounts["t0x0aa"].deliver = 2
+    out = await messages.forward_messages(ROOM, list(PACK)[:3], DM, account="t0x0aa")
+    assert out.startswith("Warning: 2 of 3 messages forwarded")
+    assert "pairing unknown" in out
+    assert "-> dst 900" not in out
+
+
+@pytest.mark.asyncio
 async def test_mismatch_shows_what_arrived(accounts):
     accounts["t0x0aa"].tamper = {256843: "совсем другой текст"}
     out = await messages.forward_messages(ROOM, [256843], DM, account="t0x0aa")
