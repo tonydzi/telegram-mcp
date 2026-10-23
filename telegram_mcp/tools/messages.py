@@ -994,7 +994,8 @@ def _fwd_preview(m, width: int = 60) -> str:
         return f"<service {type(action).__name__}>"
     date = getattr(m, "date", None)
     day = date.strftime("%Y-%m-%d") if date else "?"
-    text = (getattr(m, "message", None) or "").replace("\n", " ").strip()
+    raw = getattr(m, "message", None) or ""
+    text = sanitize_user_content(raw).replace("\n", " ").strip() if raw else ""
     if not text and getattr(m, "media", None) is not None:
         text = f"<media {type(m.media).__name__}>"
     if len(text) > width:
@@ -1042,24 +1043,28 @@ async def _forward_checked(cl, from_entity, to_entity, ids, expect_texts, label)
     sent = await cl.forward_messages(to_entity, ids, from_entity)
     if not isinstance(sent, list):
         sent = [sent]
-    sent = [m for m in sent if m is not None]
-    mismatched = [
-        (s.id, d)
-        for s, d in zip(src, sent)
-        if (getattr(s, "message", None) or "") != (getattr(d, "message", None) or "")
-    ]
-    ok = len(sent) == len(ids) and not mismatched
+    # Telethon keeps None in request order for messages that did not land;
+    # never compact the list, or later destinations shift onto earlier sources.
+    sent = list(sent) + [None] * (len(ids) - len(sent))
+    landed = sum(1 for d in sent if d is not None)
+    body, bad = [], 0
+    for i, s, d in zip(ids, src, sent):
+        if d is None:
+            bad += 1
+            body.append(f"  src {i} -> dst - · NOT DELIVERED · {_fwd_preview(s)}")
+        elif (getattr(s, "message", None) or "") != (getattr(d, "message", None) or ""):
+            bad += 1
+            body.append(
+                f"  src {i} -> dst {d.id} · TEXT DIFFERS · sent: {_fwd_preview(s)}"
+                f" · arrived: {_fwd_preview(d)}"
+            )
+        else:
+            body.append(f"  src {i} -> dst {d.id} · {_fwd_preview(s)}")
     head = (
-        f"{len(sent)} of {len(ids)} messages forwarded ({label}); "
-        f"destination check: {'OK' if ok else 'MISMATCH'}."
+        f"{landed} of {len(ids)} messages forwarded ({label}); "
+        f"destination check: {'OK' if not bad else 'MISMATCH'}."
     )
-    lines = [head if ok else "Warning: " + head]
-    for idx, i in enumerate(ids):
-        dst = sent[idx].id if idx < len(sent) else "-"
-        lines.append(f"  src {i} -> dst {dst} · {_fwd_preview(src[idx])}")
-    if mismatched:
-        lines.append(f"  text differs in destination for src ids: {[s for s, _ in mismatched]}")
-    return "\n".join(lines)
+    return "\n".join([head if not bad else "Warning: " + head] + body)
 
 
 @mcp.tool(

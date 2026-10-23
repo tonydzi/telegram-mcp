@@ -37,6 +37,8 @@ class _FakeAccount:
     def __init__(self, chats, deliver=None):
         self.chats = chats
         self.deliver = deliver  # how many forwarded messages "land"
+        self.drop = set()  # src ids Telethon reports as None (did not land)
+        self.tamper = {}  # src id -> text that "arrives" instead
         self.forwarded = []
         self._next = 9000
 
@@ -53,7 +55,10 @@ class _FakeAccount:
         for i in ids[: self.deliver if self.deliver is not None else len(ids)]:
             src = self.chats[from_entity].get(i)
             self._next += 1
-            out.append(_msg(self._next, getattr(src, "message", "")))
+            if i in self.drop:
+                out.append(None)
+                continue
+            out.append(_msg(self._next, self.tamper.get(i, getattr(src, "message", ""))))
         return out
 
 
@@ -142,3 +147,30 @@ async def test_single_forward_message_uses_same_guard(accounts):
     )
     assert out.startswith("Error: forward refused")
     assert accounts["tonyssd"].forwarded == []
+
+
+@pytest.mark.asyncio
+async def test_dropped_middle_message_keeps_pairing(accounts):
+    # Review 14.10 (Codex + Bugbot): None placeholders must not be compacted,
+    # or dst ids of later messages shift onto earlier sources.
+    accounts["t0x0aa"].drop = {256844}
+    out = await messages.forward_messages(ROOM, list(PACK)[:3], DM, account="t0x0aa")
+    assert out.startswith("Warning: 2 of 3 messages forwarded")
+    assert "src 256843 -> dst 9001 · " in out
+    assert "src 256844 -> dst - · NOT DELIVERED" in out
+    assert "src 256845 -> dst 9003 · " in out
+
+
+@pytest.mark.asyncio
+async def test_mismatch_shows_what_arrived(accounts):
+    accounts["t0x0aa"].tamper = {256843: "совсем другой текст"}
+    out = await messages.forward_messages(ROOM, [256843], DM, account="t0x0aa")
+    assert "MISMATCH" in out
+    assert "arrived: 2026-10-14 · совсем другой текст" in out
+
+
+@pytest.mark.asyncio
+async def test_receipt_text_is_sanitized(accounts):
+    accounts["t0x0aa"].chats[ROOM][256890] = _msg(256890, "abc‮def​ghi")
+    out = await messages.forward_messages(ROOM, [256890], DM, account="t0x0aa")
+    assert "‮" not in out and "​" not in out
